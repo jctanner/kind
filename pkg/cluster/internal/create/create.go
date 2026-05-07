@@ -39,6 +39,7 @@ import (
 	"sigs.k8s.io/kind/pkg/cluster/internal/create/actions/kubeadminit"
 	"sigs.k8s.io/kind/pkg/cluster/internal/create/actions/kubeadmjoin"
 	"sigs.k8s.io/kind/pkg/cluster/internal/create/actions/loadbalancer"
+	"sigs.k8s.io/kind/pkg/cluster/internal/create/actions/ocpshim"
 	"sigs.k8s.io/kind/pkg/cluster/internal/create/actions/waitforready"
 	"sigs.k8s.io/kind/pkg/cluster/internal/kubeconfig"
 )
@@ -115,6 +116,7 @@ func Cluster(logger log.Logger, p providers.Provider, opts *ClusterOptions) erro
 	if !opts.StopBeforeSettingUpKubernetes {
 		actionsToRun = append(actionsToRun,
 			kubeadminit.NewAction(opts.Config), // run kubeadm init
+			ocpshim.NewAction(),                // configure OCP API shim
 		)
 		// this step might be skipped, but is next after init
 		if !opts.Config.Networking.DisableDefaultCNI {

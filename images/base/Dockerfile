@@ -203,6 +203,17 @@ RUN git clone --filter=tree:0 "${CONTAINERD_FUSE_OVERLAYFS_CLONE_URL}" /fuse-ove
     && GOARCH=$TARGETARCH go-licenses save --save_path=/_LICENSES ./cmd/containerd-fuse-overlayfs-grpc
 
 
+# stage for building ocp-shim (API server front-proxy for OpenShift OAuth discovery)
+# source is copied into images/base/ocp-shim/ before build
+FROM go-build AS build-ocp-shim
+ARG TARGETARCH GO_VERSION
+COPY --chmod=0755 ocp-shim/ /go/src/ocp-shim/
+WORKDIR /go/src/ocp-shim
+RUN eval "$(gimme "${GO_VERSION}")" \
+    && export GOTOOLCHAIN="go${GO_VERSION}" \
+    && export GOARCH=$TARGETARCH && export CGO_ENABLED=0 \
+    && go build -o /go/bin/ocp-shim .
+
 # build final image layout from other stages
 FROM base AS build
 # copy over containerd build and install
@@ -232,6 +243,8 @@ COPY --from=build-cni /_LICENSES/* /LICENSES/
 # copy over containerd-fuse-overlayfs and install
 COPY --from=build-fuse-overlayfs /fuse-overlayfs-snapshotter/bin/containerd-fuse-overlayfs-grpc /usr/local/bin/
 COPY --from=build-fuse-overlayfs /_LICENSES/* /LICENSES/
+# copy over ocp-shim build and install
+COPY --from=build-ocp-shim /go/bin/ocp-shim /usr/local/bin/ocp-shim
 
 # squash down to one compressed layer, without any lingering whiteout files etc
 FROM scratch
