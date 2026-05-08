@@ -3,16 +3,19 @@ package main
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 )
 
 func validateOAuthToken(authHeader, validateURL string) (string, []string, bool) {
@@ -97,6 +100,167 @@ func serveUserObject(w http.ResponseWriter, username string) {
 		"identities": []string{"ocp-sim:" + username},
 		"groups":     []string{"system:authenticated"},
 	})
+}
+
+func handleProjectRequest(w http.ResponseWriter, r *http.Request, proxy *httputil.ReverseProxy) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	var req struct {
+		Metadata struct {
+			Name string `json:"name"`
+		} `json:"metadata"`
+		DisplayName string `json:"displayName"`
+		Description string `json:"description"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil || req.Metadata.Name == "" {
+		http.Error(w, "bad request: missing metadata.name", http.StatusBadRequest)
+		return
+	}
+
+	projectBody, _ := json.Marshal(map[string]interface{}{
+		"apiVersion": "project.openshift.io/v1",
+		"kind":       "Project",
+		"metadata": map[string]interface{}{
+			"name": req.Metadata.Name,
+		},
+	})
+
+	projectReq, _ := http.NewRequest("POST",
+		"/apis/project.openshift.io/v1/projects",
+		strings.NewReader(string(projectBody)))
+	projectReq.Header.Set("Content-Type", "application/json")
+	for _, h := range []string{"X-Remote-User", "X-Remote-Group", "Authorization"} {
+		if v := r.Header.Get(h); v != "" {
+			projectReq.Header.Set(h, v)
+		}
+	}
+
+	recorder := &responseRecorder{headers: http.Header{}, statusCode: 200}
+	proxy.ServeHTTP(recorder, projectReq)
+
+	if recorder.statusCode >= 300 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(recorder.statusCode)
+		w.Write(recorder.body)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"apiVersion": "project.openshift.io/v1",
+		"kind":       "Project",
+		"metadata": map[string]interface{}{
+			"name": req.Metadata.Name,
+		},
+		"status": map[string]interface{}{
+			"phase": "Active",
+		},
+	})
+}
+
+type responseRecorder struct {
+	headers    http.Header
+	body       []byte
+	statusCode int
+}
+
+func (r *responseRecorder) Header() http.Header         { return r.headers }
+func (r *responseRecorder) WriteHeader(statusCode int)   { r.statusCode = statusCode }
+func (r *responseRecorder) Write(b []byte) (int, error)  { r.body = append(r.body, b...); return len(b), nil }
+
+const wsSubprotocolPrefix = "base64url.bearer.authorization.k8s.io."
+
+func extractWebSocketBearerToken(r *http.Request) string {
+	for _, proto := range r.Header.Values("Sec-WebSocket-Protocol") {
+		for _, p := range strings.Split(proto, ",") {
+			p = strings.TrimSpace(p)
+			if strings.HasPrefix(p, wsSubprotocolPrefix) {
+				encoded := strings.TrimPrefix(p, wsSubprotocolPrefix)
+				decoded, err := base64.RawURLEncoding.DecodeString(encoded)
+				if err != nil {
+					log.Printf("ocp-shim: failed to decode websocket bearer token: %v", err)
+					return ""
+				}
+				return string(decoded)
+			}
+		}
+	}
+	return ""
+}
+
+func removeWebSocketBearerSubprotocol(r *http.Request) {
+	var kept []string
+	for _, proto := range r.Header.Values("Sec-WebSocket-Protocol") {
+		for _, p := range strings.Split(proto, ",") {
+			p = strings.TrimSpace(p)
+			if !strings.HasPrefix(p, wsSubprotocolPrefix) && p != "" {
+				kept = append(kept, p)
+			}
+		}
+	}
+	r.Header.Del("Sec-WebSocket-Protocol")
+	if len(kept) > 0 {
+		r.Header.Set("Sec-WebSocket-Protocol", strings.Join(kept, ", "))
+	}
+}
+
+func handleWebSocketProxy(w http.ResponseWriter, r *http.Request, upstreamURL *url.URL, upstreamTLS *tls.Config) {
+	upstreamHost := upstreamURL.Host
+	if !strings.Contains(upstreamHost, ":") {
+		upstreamHost += ":443"
+	}
+
+	upstreamConn, err := tls.Dial("tcp", upstreamHost, upstreamTLS)
+	if err != nil {
+		log.Printf("ocp-shim: websocket upstream dial failed: %v", err)
+		http.Error(w, "upstream connection failed", http.StatusBadGateway)
+		return
+	}
+
+	r.URL.Scheme = "https"
+	r.URL.Host = upstreamURL.Host
+	r.Header.Set("Origin", upstreamURL.Scheme+"://"+upstreamURL.Host)
+	r.Host = upstreamURL.Host
+	if err := r.Write(upstreamConn); err != nil {
+		log.Printf("ocp-shim: websocket write request to upstream failed: %v", err)
+		upstreamConn.Close()
+		http.Error(w, "upstream write failed", http.StatusBadGateway)
+		return
+	}
+
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		log.Println("ocp-shim: hijacking not supported")
+		upstreamConn.Close()
+		http.Error(w, "hijacking not supported", http.StatusInternalServerError)
+		return
+	}
+	clientConn, _, err := hijacker.Hijack()
+	if err != nil {
+		log.Printf("ocp-shim: hijack failed: %v", err)
+		upstreamConn.Close()
+		return
+	}
+
+	log.Printf("ocp-shim: websocket proxy established for %s", r.URL.Path)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	cp := func(label string, dst, src net.Conn) {
+		defer wg.Done()
+		n, err := io.Copy(dst, src)
+		log.Printf("ocp-shim: ws copy %s done: %d bytes, err=%v", label, n, err)
+	}
+	go cp("client→upstream", upstreamConn, clientConn)
+	go cp("upstream→client", clientConn, upstreamConn)
+	wg.Wait()
+	clientConn.Close()
+	upstreamConn.Close()
 }
 
 func main() {
@@ -195,6 +359,12 @@ func main() {
 			r.Body = io.NopCloser(strings.NewReader(string(bodyBytes)))
 		}
 
+		// Intercept POST /apis/project.openshift.io/v1/projectrequests
+		if r.Method == "POST" && r.URL.Path == "/apis/project.openshift.io/v1/projectrequests" {
+			handleProjectRequest(w, r, proxy)
+			return
+		}
+
 		// Intercept GET /apis/user.openshift.io/v1/users/~
 		if r.Method == "GET" && r.URL.Path == "/apis/user.openshift.io/v1/users/~" {
 			user := r.Header.Get("X-Remote-User")
@@ -205,6 +375,36 @@ func main() {
 				return
 			}
 			serveUserObject(w, user)
+			return
+		}
+
+		// WebSocket upgrade: extract bearer token from subprotocol, authenticate, then tunnel
+		if strings.EqualFold(r.Header.Get("Connection"), "upgrade") &&
+			strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+			token := extractWebSocketBearerToken(r)
+			log.Printf("ocp-shim: ws %s subproto=%q token=%q remoteUser=%q",
+				r.URL.Path,
+				r.Header.Get("Sec-WebSocket-Protocol"),
+				token,
+				r.Header.Get("X-Remote-User"))
+			if token != "" {
+				if strings.HasPrefix(token, "sha256~") {
+					user, groups, ok := validateOAuthToken("Bearer "+token, userinfoURL)
+					if ok {
+						r.Header.Set("X-Remote-User", user)
+						for _, g := range groups {
+							r.Header.Add("X-Remote-Group", g)
+						}
+						removeWebSocketBearerSubprotocol(r)
+						log.Printf("ocp-shim: websocket auth for user %s on %s", user, r.URL.Path)
+					} else {
+						log.Printf("ocp-shim: websocket OAuth validation failed for %s", r.URL.Path)
+					}
+				} else {
+					log.Printf("ocp-shim: websocket token is not sha256~: %s", token[:min(len(token), 20)])
+				}
+			}
+			handleWebSocketProxy(w, r, upstreamURL, upstreamTLS)
 			return
 		}
 
