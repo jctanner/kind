@@ -21,6 +21,7 @@ package installstorage
 import (
 	"bytes"
 	"strings"
+	"time"
 
 	"sigs.k8s.io/kind/pkg/cluster/nodes"
 	"sigs.k8s.io/kind/pkg/errors"
@@ -88,12 +89,28 @@ func addDefaultStorage(logger log.Logger, controlPlane nodes.Node) error {
 		manifest = raw.String()
 	}
 
-	// apply the manifest
-	in := strings.NewReader(manifest)
-	cmd := controlPlane.Command(
-		"kubectl",
-		"--kubeconfig=/etc/kubernetes/admin.conf", "apply", "-f", "-",
-	)
-	cmd.SetStdin(in)
-	return cmd.Run()
+	// apply the manifest with retry — the API server may still be recovering
+	// after ocp-shim patching
+	backoff := 2 * time.Second
+	var lastErr error
+	for i := 0; i < 30; i++ {
+		if i > 0 {
+			logger.Warnf("Waiting for API server to accept StorageClass (attempt %d/30)...", i+1)
+			time.Sleep(backoff)
+			if backoff < 10*time.Second {
+				backoff *= 2
+			}
+		}
+		in := strings.NewReader(manifest)
+		cmd := controlPlane.Command(
+			"kubectl",
+			"--kubeconfig=/etc/kubernetes/admin.conf", "apply", "-f", "-",
+		)
+		cmd.SetStdin(in)
+		lastErr = cmd.Run()
+		if lastErr == nil {
+			return nil
+		}
+	}
+	return lastErr
 }
