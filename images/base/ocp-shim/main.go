@@ -37,34 +37,68 @@ func validateOAuthToken(authHeader, validateURL string) (string, []string, bool)
 		return "", nil, false
 	}
 	var info struct {
-		PreferredUsername string `json:"preferred_username"`
+		PreferredUsername string   `json:"preferred_username"`
+		Groups           []string `json:"groups"`
 	}
 	if err := json.Unmarshal(body, &info); err != nil || info.PreferredUsername == "" {
 		return "", nil, false
 	}
-	return info.PreferredUsername, []string{"system:authenticated"}, true
+	groups := info.Groups
+	if len(groups) == 0 {
+		groups = []string{"system:authenticated"}
+	}
+	return info.PreferredUsername, groups, true
+}
+
+func extractTokenFromBody(body []byte) string {
+	s := string(body)
+	idx := strings.Index(s, "sha256~")
+	if idx < 0 {
+		return ""
+	}
+	end := idx
+	for end < len(s) && s[end] >= '!' && s[end] <= '~' {
+		end++
+	}
+	return s[idx:end]
 }
 
 func handleTokenReview(w http.ResponseWriter, body []byte, userinfoURL string) {
-	var review struct {
-		APIVersion string `json:"apiVersion"`
-		Kind       string `json:"kind"`
-		Spec       struct {
-			Token     string   `json:"token"`
-			Audiences []string `json:"audiences"`
-		} `json:"spec"`
+	var token string
+	isJSON := len(body) > 0 && body[0] == '{'
+
+	if isJSON {
+		var review struct {
+			Spec struct {
+				Token string `json:"token"`
+			} `json:"spec"`
+		}
+		if err := json.Unmarshal(body, &review); err != nil {
+			log.Printf("[ocp-shim] TokenReview unmarshal error: %v", err)
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		token = review.Spec.Token
+	} else {
+		token = extractTokenFromBody(body)
 	}
-	if err := json.Unmarshal(body, &review); err != nil {
+
+	if token == "" {
+		log.Printf("[ocp-shim] TokenReview: no token found")
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
 
-	user, groups, ok := validateOAuthToken("Bearer "+review.Spec.Token, userinfoURL)
+	log.Printf("[ocp-shim] TokenReview: tokenLen=%d isJSON=%v", len(token), isJSON)
+
+	user, groups, ok := validateOAuthToken("Bearer "+token, userinfoURL)
 	if !ok {
+		log.Printf("[ocp-shim] TokenReview: auth failed")
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"apiVersion": review.APIVersion,
+			"apiVersion": "authentication.k8s.io/v1",
 			"kind":       "TokenReview",
+			"metadata":   map[string]interface{}{},
 			"status": map[string]interface{}{
 				"authenticated": false,
 			},
@@ -72,10 +106,12 @@ func handleTokenReview(w http.ResponseWriter, body []byte, userinfoURL string) {
 		return
 	}
 
+	log.Printf("[ocp-shim] TokenReview: auth OK user=%s", user)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"apiVersion": review.APIVersion,
+		"apiVersion": "authentication.k8s.io/v1",
 		"kind":       "TokenReview",
+		"metadata":   map[string]interface{}{},
 		"status": map[string]interface{}{
 			"authenticated": true,
 			"user": map[string]interface{}{
@@ -87,7 +123,10 @@ func handleTokenReview(w http.ResponseWriter, body []byte, userinfoURL string) {
 	})
 }
 
-func serveUserObject(w http.ResponseWriter, username string) {
+func serveUserObject(w http.ResponseWriter, username string, groups []string) {
+	if len(groups) == 0 {
+		groups = []string{"system:authenticated"}
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"apiVersion": "user.openshift.io/v1",
@@ -98,7 +137,7 @@ func serveUserObject(w http.ResponseWriter, username string) {
 		},
 		"fullName":   username,
 		"identities": []string{"ocp-sim:" + username},
-		"groups":     []string{"system:authenticated"},
+		"groups":     groups,
 	})
 }
 
@@ -275,6 +314,11 @@ func main() {
 	oauthUserinfoURL := flag.String("oauth-userinfo-url", "https://localhost:9443/oauth/userinfo", "URL of the simulator OAuth userinfo endpoint")
 	flag.Parse()
 
+	logFile, err := os.OpenFile("/tmp/ocp-shim.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err == nil {
+		log.SetOutput(logFile)
+	}
+
 	if *tlsCert == "" || *tlsKey == "" {
 		log.Fatal("--tls-cert-file and --tls-key-file are required")
 	}
@@ -349,10 +393,17 @@ func main() {
 			}
 		}
 
+		// Log all tokenreview requests for debugging
+		if strings.Contains(r.URL.Path, "tokenreview") {
+			log.Printf("[ocp-shim] tokenreview request: method=%s path=%s from=%s", r.Method, r.URL.Path, r.RemoteAddr)
+		}
+
 		// Intercept POST /apis/authentication.k8s.io/v1/tokenreviews for sha256~ tokens
 		if r.Method == "POST" && r.URL.Path == "/apis/authentication.k8s.io/v1/tokenreviews" {
 			bodyBytes, err := io.ReadAll(r.Body)
-			if err == nil && strings.Contains(string(bodyBytes), "sha256~") {
+			hasSHA := strings.Contains(string(bodyBytes), "sha256~")
+			log.Printf("[ocp-shim] TokenReview body: len=%d hasSHA256=%v from=%s", len(bodyBytes), hasSHA, r.RemoteAddr)
+			if err == nil && hasSHA {
 				handleTokenReview(w, bodyBytes, userinfoURL)
 				return
 			}
@@ -374,7 +425,7 @@ func main() {
 				w.Write([]byte(`{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","message":"Unauthorized","reason":"Unauthorized","code":401}`))
 				return
 			}
-			serveUserObject(w, user)
+			serveUserObject(w, user, r.Header.Values("X-Remote-Group"))
 			return
 		}
 

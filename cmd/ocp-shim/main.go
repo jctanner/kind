@@ -37,12 +37,17 @@ func validateOAuthToken(authHeader, validateURL string) (string, []string, bool)
 		return "", nil, false
 	}
 	var info struct {
-		PreferredUsername string `json:"preferred_username"`
+		PreferredUsername string   `json:"preferred_username"`
+		Groups           []string `json:"groups"`
 	}
 	if err := json.Unmarshal(body, &info); err != nil || info.PreferredUsername == "" {
 		return "", nil, false
 	}
-	return info.PreferredUsername, []string{"system:authenticated"}, true
+	groups := info.Groups
+	if len(groups) == 0 {
+		groups = []string{"system:authenticated"}
+	}
+	return info.PreferredUsername, groups, true
 }
 
 func extractTokenFromBody(body []byte) string {
@@ -118,7 +123,10 @@ func handleTokenReview(w http.ResponseWriter, body []byte, userinfoURL string) {
 	})
 }
 
-func serveUserObject(w http.ResponseWriter, username string) {
+func serveUserObject(w http.ResponseWriter, username string, groups []string) {
+	if len(groups) == 0 {
+		groups = []string{"system:authenticated"}
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"apiVersion": "user.openshift.io/v1",
@@ -129,7 +137,7 @@ func serveUserObject(w http.ResponseWriter, username string) {
 		},
 		"fullName":   username,
 		"identities": []string{"ocp-sim:" + username},
-		"groups":     []string{"system:authenticated"},
+		"groups":     groups,
 	})
 }
 
@@ -417,7 +425,7 @@ func main() {
 				w.Write([]byte(`{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","message":"Unauthorized","reason":"Unauthorized","code":401}`))
 				return
 			}
-			serveUserObject(w, user)
+			serveUserObject(w, user, r.Header.Values("X-Remote-Group"))
 			return
 		}
 
