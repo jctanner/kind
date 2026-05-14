@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
@@ -9,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -16,7 +18,150 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
 )
+
+// JWKSCache fetches and caches JWKS keys from an OIDC issuer
+type JWKSCache struct {
+	mu   sync.RWMutex
+	keys map[string]*rsa.PublicKey
+}
+
+func newJWKSCache(issuerURL string) *JWKSCache {
+	cache := &JWKSCache{keys: make(map[string]*rsa.PublicKey)}
+	cache.refresh(issuerURL)
+	go func() {
+		for {
+			time.Sleep(5 * time.Minute)
+			cache.refresh(issuerURL)
+		}
+	}()
+	return cache
+}
+
+func (c *JWKSCache) refresh(issuerURL string) {
+	client := &http.Client{
+		Timeout:   10 * time.Second,
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
+	}
+
+	// Fetch OIDC discovery
+	discoveryURL := strings.TrimRight(issuerURL, "/") + "/.well-known/openid-configuration"
+	resp, err := client.Get(discoveryURL)
+	if err != nil {
+		log.Printf("[ocp-shim] JWKS refresh: discovery fetch failed: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	var discovery struct {
+		JwksURI string `json:"jwks_uri"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&discovery); err != nil || discovery.JwksURI == "" {
+		log.Printf("[ocp-shim] JWKS refresh: discovery parse failed: %v", err)
+		return
+	}
+
+	// Fetch JWKS
+	resp2, err := client.Get(discovery.JwksURI)
+	if err != nil {
+		log.Printf("[ocp-shim] JWKS refresh: jwks fetch failed: %v", err)
+		return
+	}
+	defer resp2.Body.Close()
+	var jwks struct {
+		Keys []struct {
+			Kty string `json:"kty"`
+			Kid string `json:"kid"`
+			N   string `json:"n"`
+			E   string `json:"e"`
+		} `json:"keys"`
+	}
+	if err := json.NewDecoder(resp2.Body).Decode(&jwks); err != nil {
+		log.Printf("[ocp-shim] JWKS refresh: jwks parse failed: %v", err)
+		return
+	}
+
+	newKeys := make(map[string]*rsa.PublicKey)
+	for _, k := range jwks.Keys {
+		if k.Kty != "RSA" {
+			continue
+		}
+		nBytes, err := base64.RawURLEncoding.DecodeString(k.N)
+		if err != nil {
+			continue
+		}
+		eBytes, err := base64.RawURLEncoding.DecodeString(k.E)
+		if err != nil {
+			continue
+		}
+		e := 0
+		for _, b := range eBytes {
+			e = e<<8 + int(b)
+		}
+		newKeys[k.Kid] = &rsa.PublicKey{
+			N: new(big.Int).SetBytes(nBytes),
+			E: e,
+		}
+	}
+
+	c.mu.Lock()
+	c.keys = newKeys
+	c.mu.Unlock()
+	log.Printf("[ocp-shim] JWKS refresh: loaded %d keys", len(newKeys))
+}
+
+func (c *JWKSCache) getKey(kid string) *rsa.PublicKey {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.keys[kid]
+}
+
+func validateJWTToken(tokenStr string, cache *JWKSCache) (string, []string, bool) {
+	token, err := jwt.Parse(tokenStr, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodRSA); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+		}
+		kid, _ := token.Header["kid"].(string)
+		key := cache.getKey(kid)
+		if key == nil {
+			return nil, fmt.Errorf("unknown kid: %s", kid)
+		}
+		return key, nil
+	})
+	if err != nil || !token.Valid {
+		log.Printf("[ocp-shim] JWT validation failed: %v", err)
+		return "", nil, false
+	}
+
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		return "", nil, false
+	}
+
+	username, _ := claims["preferred_username"].(string)
+	if username == "" {
+		username, _ = claims["sub"].(string)
+	}
+	if username == "" {
+		return "", nil, false
+	}
+
+	var groups []string
+	if g, ok := claims["groups"].([]interface{}); ok {
+		for _, v := range g {
+			if s, ok := v.(string); ok {
+				groups = append(groups, s)
+			}
+		}
+	}
+	if len(groups) == 0 {
+		groups = []string{"system:authenticated"}
+	}
+
+	return username, groups, true
+}
 
 func validateOAuthToken(authHeader, validateURL string) (string, []string, bool) {
 	req, err := http.NewRequest("GET", validateURL, nil)
@@ -52,18 +197,21 @@ func validateOAuthToken(authHeader, validateURL string) (string, []string, bool)
 
 func extractTokenFromBody(body []byte) string {
 	s := string(body)
-	idx := strings.Index(s, "sha256~")
-	if idx < 0 {
-		return ""
+	for _, prefix := range []string{"sha256~", "eyJ"} {
+		idx := strings.Index(s, prefix)
+		if idx < 0 {
+			continue
+		}
+		end := idx
+		for end < len(s) && s[end] >= '!' && s[end] <= '~' {
+			end++
+		}
+		return s[idx:end]
 	}
-	end := idx
-	for end < len(s) && s[end] >= '!' && s[end] <= '~' {
-		end++
-	}
-	return s[idx:end]
+	return ""
 }
 
-func handleTokenReview(w http.ResponseWriter, body []byte, userinfoURL string) {
+func handleTokenReview(w http.ResponseWriter, body []byte, userinfoURL string, jwksCache *JWKSCache) {
 	var token string
 	isJSON := len(body) > 0 && body[0] == '{'
 
@@ -91,7 +239,14 @@ func handleTokenReview(w http.ResponseWriter, body []byte, userinfoURL string) {
 
 	log.Printf("[ocp-shim] TokenReview: tokenLen=%d isJSON=%v", len(token), isJSON)
 
-	user, groups, ok := validateOAuthToken("Bearer "+token, userinfoURL)
+	var user string
+	var groups []string
+	var ok bool
+	if strings.HasPrefix(token, "eyJ") && jwksCache != nil {
+		user, groups, ok = validateJWTToken(token, jwksCache)
+	} else {
+		user, groups, ok = validateOAuthToken("Bearer "+token, userinfoURL)
+	}
 	if !ok {
 		log.Printf("[ocp-shim] TokenReview: auth failed")
 		w.Header().Set("Content-Type", "application/json")
@@ -311,7 +466,8 @@ func main() {
 	proxyClientCert := flag.String("proxy-client-cert-file", "", "client cert for authenticating to upstream as front-proxy")
 	proxyClientKey := flag.String("proxy-client-key-file", "", "client key for authenticating to upstream as front-proxy")
 	wellKnownFile := flag.String("well-known-file", "", "path to well-known OAuth discovery JSON file")
-	oauthUserinfoURL := flag.String("oauth-userinfo-url", "https://localhost:9443/oauth/userinfo", "URL of the simulator OAuth userinfo endpoint")
+	oauthUserinfoURL := flag.String("oauth-userinfo-url", "https://localhost:443/oauth/userinfo", "URL of the simulator OAuth userinfo endpoint")
+	oidcIssuerURL := flag.String("oidc-issuer-url", "", "OIDC issuer URL for JWT validation via JWKS (enables dual-mode auth)")
 	flag.Parse()
 
 	logFile, err := os.OpenFile("/tmp/ocp-shim.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
@@ -364,15 +520,33 @@ func main() {
 
 	userinfoURL := *oauthUserinfoURL
 
+	issuerURL := *oidcIssuerURL
+	if envIssuer := os.Getenv("OIDC_ISSUER_URL"); envIssuer != "" {
+		issuerURL = envIssuer
+	}
+	var jwksCache *JWKSCache
+	if issuerURL != "" {
+		jwksCache = newJWKSCache(issuerURL)
+		fmt.Printf("ocp-shim: OIDC JWKS validation enabled (issuer: %s)\n", issuerURL)
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/.well-known/oauth-authorization-server", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(wellKnownData)
 	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// Bearer token validation: translate sha256~ tokens to front-proxy headers
-		if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer sha256~") {
-			user, groups, ok := validateOAuthToken(auth, userinfoURL)
+		// Bearer token validation: translate tokens to front-proxy headers
+		if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+			tokenStr := strings.TrimPrefix(auth, "Bearer ")
+			var user string
+			var groups []string
+			var ok bool
+			if strings.HasPrefix(tokenStr, "sha256~") {
+				user, groups, ok = validateOAuthToken(auth, userinfoURL)
+			} else if strings.HasPrefix(tokenStr, "eyJ") && jwksCache != nil {
+				user, groups, ok = validateJWTToken(tokenStr, jwksCache)
+			}
 			if ok {
 				r.Header.Del("Authorization")
 				r.Header.Set("X-Remote-User", user)
@@ -398,13 +572,14 @@ func main() {
 			log.Printf("[ocp-shim] tokenreview request: method=%s path=%s from=%s", r.Method, r.URL.Path, r.RemoteAddr)
 		}
 
-		// Intercept POST /apis/authentication.k8s.io/v1/tokenreviews for sha256~ tokens
+		// Intercept POST /apis/authentication.k8s.io/v1/tokenreviews for sha256~ and JWT tokens
 		if r.Method == "POST" && r.URL.Path == "/apis/authentication.k8s.io/v1/tokenreviews" {
 			bodyBytes, err := io.ReadAll(r.Body)
 			hasSHA := strings.Contains(string(bodyBytes), "sha256~")
-			log.Printf("[ocp-shim] TokenReview body: len=%d hasSHA256=%v from=%s", len(bodyBytes), hasSHA, r.RemoteAddr)
-			if err == nil && hasSHA {
-				handleTokenReview(w, bodyBytes, userinfoURL)
+			hasJWT := strings.Contains(string(bodyBytes), "eyJ")
+			log.Printf("[ocp-shim] TokenReview body: len=%d hasSHA256=%v hasJWT=%v from=%s", len(bodyBytes), hasSHA, hasJWT, r.RemoteAddr)
+			if err == nil && (hasSHA || (hasJWT && jwksCache != nil)) {
+				handleTokenReview(w, bodyBytes, userinfoURL, jwksCache)
 				return
 			}
 			r.Body = io.NopCloser(strings.NewReader(string(bodyBytes)))
@@ -439,20 +614,25 @@ func main() {
 				token,
 				r.Header.Get("X-Remote-User"))
 			if token != "" {
+				var user string
+				var groups []string
+				var ok bool
 				if strings.HasPrefix(token, "sha256~") {
-					user, groups, ok := validateOAuthToken("Bearer "+token, userinfoURL)
-					if ok {
-						r.Header.Set("X-Remote-User", user)
-						for _, g := range groups {
-							r.Header.Add("X-Remote-Group", g)
-						}
-						removeWebSocketBearerSubprotocol(r)
-						log.Printf("ocp-shim: websocket auth for user %s on %s", user, r.URL.Path)
-					} else {
-						log.Printf("ocp-shim: websocket OAuth validation failed for %s", r.URL.Path)
-					}
+					user, groups, ok = validateOAuthToken("Bearer "+token, userinfoURL)
+				} else if strings.HasPrefix(token, "eyJ") && jwksCache != nil {
+					user, groups, ok = validateJWTToken(token, jwksCache)
 				} else {
-					log.Printf("ocp-shim: websocket token is not sha256~: %s", token[:min(len(token), 20)])
+					log.Printf("ocp-shim: websocket token unrecognized: %s", token[:min(len(token), 20)])
+				}
+				if ok {
+					r.Header.Set("X-Remote-User", user)
+					for _, g := range groups {
+						r.Header.Add("X-Remote-Group", g)
+					}
+					removeWebSocketBearerSubprotocol(r)
+					log.Printf("ocp-shim: websocket auth for user %s on %s", user, r.URL.Path)
+				} else if user == "" && !ok && token != "" {
+					log.Printf("ocp-shim: websocket auth failed for %s", r.URL.Path)
 				}
 			}
 			handleWebSocketProxy(w, r, upstreamURL, upstreamTLS)
@@ -482,6 +662,9 @@ func main() {
 		fmt.Println("ocp-shim: front-proxy client certificate configured")
 	}
 	fmt.Printf("ocp-shim: OAuth userinfo URL: %s\n", userinfoURL)
+	if issuerURL != "" {
+		fmt.Printf("ocp-shim: OIDC issuer URL: %s\n", issuerURL)
+	}
 	if err := server.ListenAndServeTLS(*tlsCert, *tlsKey); err != nil {
 		log.Fatalf("server failed: %v", err)
 	}

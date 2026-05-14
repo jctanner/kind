@@ -37,9 +37,9 @@ func NewAction() actions.Action {
 }
 
 const wellKnownJSON = `{
-  "issuer": "https://oauth-openshift.apps.ocp-sim.test:9443",
-  "authorization_endpoint": "https://oauth-openshift.apps.ocp-sim.test:9443/oauth/authorize",
-  "token_endpoint": "https://oauth-openshift.apps.ocp-sim.test:9443/oauth/token",
+  "issuer": "https://oauth-openshift.apps.ocp-sim.test",
+  "authorization_endpoint": "https://oauth-openshift.apps.ocp-sim.test/oauth/authorize",
+  "token_endpoint": "https://oauth-openshift.apps.ocp-sim.test/oauth/token",
   "scopes_supported": ["user:check-access","user:full","user:info","user:list-projects"],
   "response_types_supported": ["code","token"],
   "grant_types_supported": ["authorization_code","implicit"],
@@ -209,6 +209,7 @@ command:
   - --proxy-client-cert-file=/etc/kubernetes/pki/front-proxy-client.crt
   - --proxy-client-key-file=/etc/kubernetes/pki/front-proxy-client.key
   - --well-known-file=/etc/kubernetes/ocp-shim/well-known.json
+  - --oidc-issuer-url=https://localhost:9443
 ports:
   - containerPort: 6443
     hostPort: 6443
