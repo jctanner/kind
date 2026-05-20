@@ -210,6 +210,7 @@ command:
   - --proxy-client-key-file=/etc/kubernetes/pki/front-proxy-client.key
   - --well-known-file=/etc/kubernetes/ocp-shim/well-known.json
   - --oidc-issuer-url=https://localhost:9443
+  - --oauth-userinfo-url=https://localhost:9443/oauth/userinfo
 ports:
   - containerPort: 6443
     hostPort: 6443
