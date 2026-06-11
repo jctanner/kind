@@ -278,6 +278,51 @@ func handleTokenReview(w http.ResponseWriter, body []byte, userinfoURL string, j
 	})
 }
 
+// tryHandleTokenReview attempts to validate a JWT TokenReview against ocp-shim's JWKS.
+// Returns true if the token was validated (response written), false if validation failed
+// and the request should be passed through to the real API server.
+func tryHandleTokenReview(w http.ResponseWriter, body []byte, userinfoURL string, jwksCache *JWKSCache) bool {
+	var token string
+	var review struct {
+		Spec struct {
+			Token string `json:"token"`
+		} `json:"spec"`
+	}
+	if len(body) > 0 && body[0] == '{' {
+		if err := json.Unmarshal(body, &review); err != nil {
+			return false
+		}
+		token = review.Spec.Token
+	} else {
+		token = extractTokenFromBody(body)
+	}
+	if token == "" || !strings.HasPrefix(token, "eyJ") {
+		return false
+	}
+
+	user, groups, ok := validateJWTToken(token, jwksCache)
+	if !ok {
+		return false
+	}
+
+	log.Printf("[ocp-shim] TokenReview: JWT auth OK user=%s (ocp-shim JWKS)", user)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"apiVersion": "authentication.k8s.io/v1",
+		"kind":       "TokenReview",
+		"metadata":   map[string]interface{}{},
+		"status": map[string]interface{}{
+			"authenticated": true,
+			"user": map[string]interface{}{
+				"username": user,
+				"uid":      "ocp-sim-" + user,
+				"groups":   groups,
+			},
+		},
+	})
+	return true
+}
+
 func serveUserObject(w http.ResponseWriter, username string, groups []string) {
 	if len(groups) == 0 {
 		groups = []string{"system:authenticated"}
@@ -572,15 +617,24 @@ func main() {
 			log.Printf("[ocp-shim] tokenreview request: method=%s path=%s from=%s", r.Method, r.URL.Path, r.RemoteAddr)
 		}
 
-		// Intercept POST /apis/authentication.k8s.io/v1/tokenreviews for sha256~ and JWT tokens
+		// Intercept POST /apis/authentication.k8s.io/v1/tokenreviews
+		// sha256~ tokens: always handle locally (the real API server can't validate these)
+		// JWT tokens: try ocp-shim's JWKS first (for user login tokens), but fall through
+		// to the real API server if validation fails (for SA tokens signed by kube-apiserver)
 		if r.Method == "POST" && r.URL.Path == "/apis/authentication.k8s.io/v1/tokenreviews" {
 			bodyBytes, err := io.ReadAll(r.Body)
 			hasSHA := strings.Contains(string(bodyBytes), "sha256~")
 			hasJWT := strings.Contains(string(bodyBytes), "eyJ")
 			log.Printf("[ocp-shim] TokenReview body: len=%d hasSHA256=%v hasJWT=%v from=%s", len(bodyBytes), hasSHA, hasJWT, r.RemoteAddr)
-			if err == nil && (hasSHA || (hasJWT && jwksCache != nil)) {
+			if err == nil && hasSHA {
 				handleTokenReview(w, bodyBytes, userinfoURL, jwksCache)
 				return
+			}
+			if err == nil && hasJWT && jwksCache != nil {
+				if tryHandleTokenReview(w, bodyBytes, userinfoURL, jwksCache) {
+					return
+				}
+				log.Printf("[ocp-shim] TokenReview: JWT not validated by ocp-shim JWKS, passing through to real API server")
 			}
 			r.Body = io.NopCloser(strings.NewReader(string(bodyBytes)))
 		}
